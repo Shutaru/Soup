@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "reference_file_sha256": "32f4ca62ad54d54b358b55c3be479c01f6ff00146dcde0253c845bb63adf0fa8",
+  "reference_file_sha256": "606ee2064e9423a05a5a0e02563a81736e07b8aa0e719aa3bb4301c92d89e4c8",
   "restored_files": 281,
   "distinct_objects": 249,
   "note": "All retained original evidence files reconstruct byte-for-byte. The original A failure, its three reused normal gates, recovery and failed planning screen remain distinct from the separately declared B experiment. Frozen sources are bound to Git blobs; no source ZIP or model is checked in.",
@@ -22,7 +22,7 @@
     "mlp-diagnostic-v1-recovery/original-audit.json": "c0c0d727dac4d3df21a692d22912480a1135d3bde4741946acf98f1d06354127",
     "mlp-diagnostic-v1-recovery/RULE.md": "6e4f5b256b8e60ca4cd99601efe52d1c2bf2cb1c2edef1484971e4b53bc44e65",
     "objects.json": "983d31c9ec10455cd6b61c74147caff2f25210b25eb07bfa01cf13eda59a1469",
-    "source-blobs.json": "5e713915443a9e518d9ef8ac596b1d66d4f7f9de66c96d2a2a8d89666430c74d",
+    "source-blobs.json": "defdcacf1637d48342b25977aaee0df0ec62c98df6acb6219785a247e0c9a550",
     "validation.json": "15b87ec481c46ad8cff1aa4565e0f3a514208434bacc6f17449a2b11a70370b9"
   }
 }
