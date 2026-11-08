@@ -13,6 +13,7 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.text import Text
 
 from soup_cli.config.deprecation import EXPORT_FORMATS_REMOVED_IN
 from soup_cli.utils.terminal import for_terminal, strip_control
@@ -166,13 +167,16 @@ def export(
                 f"\n[yellow]--format {fmt} was removed in v{EXPORT_FORMATS_REMOVED_IN}.[/]"
             )
         console.print(
-            f"[red]Unsupported format: {fmt}[/]{removed_notice}\n"
-            f"Supported: {', '.join(SUPPORTED_FORMATS)}"
+            Text.assemble(
+                (f"Unsupported format: {strip_control(fmt)}", "red"),
+                Text.from_markup(removed_notice),
+                f"\nSupported: {', '.join(SUPPORTED_FORMATS)}",
+            )
         )
         raise typer.Exit(1)
 
     if not model_path.exists():
-        console.print(f"[red]Model path not found: {model_path}[/]")
+        console.print(Text(f"Model path not found: {strip_control(model_path)}", style="red"))
         raise typer.Exit(1)
 
     if (verbose or no_install_deps) and fmt != "gguf":
@@ -194,8 +198,10 @@ def export(
             raise typer.Exit(1)
         if deploy != "ollama":
             console.print(
-                f"[red]Unsupported deploy target: {deploy}[/]\n"
-                "Supported: ollama"
+                Text.assemble(
+                    (f"Unsupported deploy target: {strip_control(deploy)}", "red"),
+                    "\nSupported: ollama",
+                )
             )
             raise typer.Exit(1)
 
@@ -306,6 +312,7 @@ def export(
     adapter_config_path = model_path / "adapter_config.json"
     is_adapter = adapter_config_path.exists()
     merge_dir = None
+    merge_dir_created = False
 
     if is_adapter:
         console.print("[dim]GGUF: merge adapter...[/]")
@@ -318,7 +325,7 @@ def export(
             )
             raise typer.Exit(1)
 
-        merge_dir = model_path.parent / f".soup_merge_tmp_{model_path.name}"
+        merge_dir, merge_dir_created = _merge_dir_for(model_path)
 
     # #1464: this try must begin before _merge_adapter so later failures clean the merge dir.
     try:
@@ -404,9 +411,7 @@ def export(
 
     finally:
         # Clean up temporary merge directory
-        if merge_dir and merge_dir.exists():
-            console.print("[dim]Cleaning up temporary merge files...[/]")
-            shutil.rmtree(merge_dir, ignore_errors=True)
+        _remove_merge_dir(merge_dir, merge_dir_created)
 
     if not output_path.exists():
         console.print("[red]Export failed - output file not created.[/]")
@@ -452,6 +457,29 @@ def _detect_base_model(adapter_config_path: Path) -> Optional[str]:
         return None
 
 
+def _merge_dir_for(model_path: Path) -> tuple[Path, bool]:
+    """The scratch directory next to an adapter, and whether this export will create it.
+
+    A directory (or link) already there is not this export's: the cleanup leaves it alone.
+    """
+    path = model_path.parent / f".soup_merge_tmp_{model_path.name}"
+    return path, not (path.exists() or path.is_symlink())
+
+
+def _remove_merge_dir(merge_dir: Optional[Path], created: bool, *, announce: bool = True) -> None:
+    """Remove the scratch merge directory if this export created it; never one that was there."""
+    if merge_dir is None or not merge_dir.exists():
+        return
+    if not created:
+        console.print(
+            f"[dim]Leaving {for_terminal(str(merge_dir))}: it existed before this export.[/]"
+        )
+        return
+    if announce:
+        console.print("[dim]Cleaning up temporary merge files...[/]")
+    shutil.rmtree(merge_dir, ignore_errors=True)
+
+
 def _merge_adapter(
     adapter_path: str,
     base_model: str,
@@ -486,7 +514,7 @@ def _merge_adapter(
         console.print("[dim]Base revision: unknown (legacy, local source or base override)[/]")
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         trust_remote_code=trc,
         device_map="cpu",
         **revision_kwargs,
@@ -591,7 +619,7 @@ def _existing_llama_cpp(user_path: Optional[str] = None) -> Optional[Path]:
         path = Path(user_path)
         if path.exists():
             return path
-        console.print(f"[red]llama.cpp not found at: {path}[/]")
+        console.print(Text(f"llama.cpp not found at: {strip_control(path)}", style="red"))
         raise typer.Exit(1)
 
     # 2. LLAMA_CPP_PATH env var
@@ -832,6 +860,7 @@ def _export_onnx(
     adapter_config_path = model_path / "adapter_config.json"
     is_adapter = adapter_config_path.exists()
     merge_dir = None
+    merge_dir_created = False
     source_path = model_path
 
     if is_adapter:
@@ -843,7 +872,7 @@ def _export_onnx(
                 "Please specify with [bold]--base[/] flag."
             )
             raise typer.Exit(1)
-        merge_dir = model_path.parent / f".soup_merge_tmp_{model_path.name}"
+        merge_dir, merge_dir_created = _merge_dir_for(model_path)
 
     output_path = Path(output) if output else model_path.parent / f"{model_path.name}_onnx"
 
@@ -877,9 +906,7 @@ def _export_onnx(
             console.print(f"[red]ONNX export failed:[/] {exc}")
             raise typer.Exit(1)
     finally:
-        if merge_dir and merge_dir.exists():
-            console.print("[dim]Cleaning up temporary merge files...[/]")
-            shutil.rmtree(merge_dir, ignore_errors=True)
+        _remove_merge_dir(merge_dir, merge_dir_created)
 
     console.print(
         Panel(
@@ -936,6 +963,7 @@ def _export_tensorrt(
     adapter_config_path = model_path / "adapter_config.json"
     is_adapter = adapter_config_path.exists()
     merge_dir = None
+    merge_dir_created = False
     source_path = model_path
 
     if is_adapter:
@@ -947,7 +975,7 @@ def _export_tensorrt(
                 "Please specify with [bold]--base[/] flag."
             )
             raise typer.Exit(1)
-        merge_dir = model_path.parent / f".soup_merge_tmp_{model_path.name}"
+        merge_dir, merge_dir_created = _merge_dir_for(model_path)
 
     output_path = Path(output) if output else model_path.parent / f"{model_path.name}_trt"
 
@@ -1025,9 +1053,7 @@ def _export_tensorrt(
             raise typer.Exit(1)
 
     finally:
-        if merge_dir and merge_dir.exists():
-            console.print("[dim]Cleaning up temporary merge files...[/]")
-            shutil.rmtree(merge_dir, ignore_errors=True)
+        _remove_merge_dir(merge_dir, merge_dir_created)
 
     console.print(
         Panel(
@@ -1284,13 +1310,14 @@ def _export_bitnet_gguf(
 
     adapter_config_path = model_path / "adapter_config.json"
     merge_dir = None
+    merge_dir_created = False
     if adapter_config_path.exists():
         console.print("[yellow]LoRA adapter detected — merging first...[/]")
         base_model = base or _detect_base_model(adapter_config_path)
         if not base_model:
             console.print("[red]Cannot detect base model. Pass --base.[/]")
             raise typer.Exit(2)
-        merge_dir = model_path.parent / f".soup_merge_tmp_{model_path.name}"
+        merge_dir, merge_dir_created = _merge_dir_for(model_path)
 
     # #1464: this try must begin before _merge_adapter so later failures clean the merge dir.
     try:
@@ -1322,8 +1349,7 @@ def _export_bitnet_gguf(
             console.print(f"[red]BitNet GGUF export failed: {exc}[/]")
             raise typer.Exit(1)
     finally:
-        if merge_dir and merge_dir.exists():
-            shutil.rmtree(merge_dir, ignore_errors=True)
+        _remove_merge_dir(merge_dir, merge_dir_created, announce=False)
 
     console.print(Panel(
         f"Output: [bold]{output_path}[/]\n"
@@ -1393,6 +1419,7 @@ def _export_gguf_advanced(
     # Pre-merge LoRA adapter if needed
     adapter_config_path = model_path / "adapter_config.json"
     merge_dir = None
+    merge_dir_created = False
     if adapter_config_path.exists():
         console.print("[yellow]LoRA adapter detected — merging first...[/]")
         base_model = base or _detect_base_model(adapter_config_path)
@@ -1401,7 +1428,7 @@ def _export_gguf_advanced(
                 "[red]Cannot detect base model. Pass --base.[/]"
             )
             raise typer.Exit(2)
-        merge_dir = model_path.parent / f".soup_merge_tmp_{model_path.name}"
+        merge_dir, merge_dir_created = _merge_dir_for(model_path)
 
     # #1464: this try must begin before _merge_adapter so later failures clean the merge dir.
     try:
@@ -1435,8 +1462,7 @@ def _export_gguf_advanced(
             console.print(f"[red]Advanced GGUF export failed: {exc}[/]")
             raise typer.Exit(1)
     finally:
-        if merge_dir and merge_dir.exists():
-            shutil.rmtree(merge_dir, ignore_errors=True)
+        _remove_merge_dir(merge_dir, merge_dir_created, announce=False)
 
     console.print(Panel(
         f"Output: [bold]{output_path}[/]\n"

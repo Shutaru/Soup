@@ -270,6 +270,12 @@ row 91: 94% of step 340's loss, 3,900 tokens
 Inspect or drop this row, then retrain.
 ```
 
+`soup rewind --json` writes `run_id`, `step`, `spikes` and `rows`. The file is strict
+JSON: a non-finite loss, baseline or ratio is written as `null` and the object that
+held it carries `non_finite: true`, so `json.loads()` reads it without accepting the
+non-standard `NaN` / `Infinity` tokens. The flag keeps "the run measured a non-finite
+value" distinct from a field that was never measured (which is a plain `null`).
+
 Scope: task `sft` on the transformers and MLX backends, single process, on the plain
 text path. The recorder turns itself off, with one warning naming the reason, for
 resumed runs, `packing` / `padding_free`, multipack, vision, audio, a pre-tokenised
@@ -353,7 +359,7 @@ Pick between the three "LoRA off" modes by how much you want to train:
 > `r: 0`; the same is true of the Spectrum and LISA full-FT paths.)
 
 **Load dtype** (#339, #471, #492): a frozen base — LoRA, or QLoRA — loads at
-the checkpoint's own dtype (`torch_dtype="auto"`) instead of always upcasting to fp32,
+the checkpoint's own dtype (`dtype="auto"`) instead of always upcasting to fp32,
 since the base never receives an optimizer step. Measured on an H100,
 Llama-3.1-8B, LoRA: 48,241 MiB peak -> 18,658 MiB, a 28.9 GB / 2.59x saving.
 On a pre-Ampere CUDA card (T4 / P100 / V100 / GTX 16xx / RTX 20xx), `"auto"`
@@ -595,7 +601,7 @@ soup train --config unlearn.yaml --yes
 soup eval unlearning <run-id> --benchmark tofu --evidence evidence.json --output report.json
 ```
 
-`task: unlearn` is live (v0.71.9): it loads a LoRA-wrapped policy, a frozen reference copy (NPO / RMU), and the forget / retain JSONL sets, then optimises the per-method loss — NPO's `(2/β)·mean(-logσ(-β·(π_logp − ref_logp)))` drives the policy's forget-set log-prob below the reference (= forgetting), while the retain set anchors capability. Run NPO/SimNPO **with** a `retain_set` — without one the policy has no utility anchor and Soup warns loudly.
+`task: unlearn` is live (v0.71.9): it loads a LoRA-wrapped policy, a frozen reference copy (NPO / RMU), and the forget / retain JSONL sets, then optimises the per-method loss — NPO's `(2/β)·mean(-logσ(-β·(π_logp − ref_logp)))` drives the policy's forget-set log-prob below the reference (= forgetting), while the retain set anchors capability. Run NPO/SimNPO **with** a `retain_set` — without one the policy has no utility anchor and Soup warns loudly. A `forget_set` or a `retain_set` that is set but yields no usable row is refused, naming the file, before any model loads.
 
 Unlearning honors `training.optimizer`, `scheduler`, `warmup_ratio`, `weight_decay`,
 `max_grad_norm`, `batch_size`, `gradient_accumulation_steps` and
@@ -784,7 +790,14 @@ training:
 `reasoning_effort` injects `<|reasoning_effort|>high<|/reasoning_effort|>` into
 the system turn (creating one if absent). `train_on_eot=True` makes the model
 learn when to stop generating by training on the trailing EOS token instead of
-masking it out. Both load only on `task: sft`, `tts` and `distill`.
+masking it out. Both load only on `task: sft`, `tts` and `distill`, and inside
+`task: sft` only where they are applied. The vision and audio setups,
+`data.format: raft` and `backend: mlx` apply neither, and
+`data.format: pre_tokenized` drops `reasoning_effort`, so setting a field on one
+of those paths fails at config load, naming the path and the fix. The text path
+is unaffected, including `backend: unsloth` and `training.stream_layers: true`,
+and `train_on_eot` keeps loading with `data.format: pre_tokenized`, where
+`soup data preprocess` bakes it into the cache's mask mode.
 
 
 ## EBFT / GDPO Loss Variants
@@ -1361,6 +1374,36 @@ frozen reference.
 Same input format as DPO; rows are split internally to TRL's BCO
 unpaired schema (`{prompt, completion, label}`).
 
+**When the prompt is cut, for all six preference tasks (transformers
+backend).** TRL 0.29 no longer exposes `max_prompt_length`, so `soup train`
+enforces `data.max_length` itself
+on TRL's tokenized rows, for the train and validation splits. A row whose
+prompt plus longest answer fits in `data.max_length` reaches the trainer
+unchanged, however long its prompt. A row that overflows has a prompt longer than
+`data.max_length // 2` tokens cut to that many, and its answers cut to the room
+left, so every sequence is at most `data.max_length`. Which end of the prompt survives the
+cut is each TRL trainer's own `truncation_mode`:
+
+| Task (transformers backend) | Prompt cut | End kept |
+|---|---|---|
+| `dpo` | only when the row does not fit `data.max_length` (#1209) | start (`keep_start`) |
+| `ipo` | only when the row does not fit `data.max_length` | start (`keep_start`, as DPO) |
+| `orpo` | only when the row does not fit `data.max_length` (#1209) | end (`keep_end`), BOS kept in front |
+| `simpo` | only when the row does not fit `data.max_length` | end (`keep_end`), BOS kept in front |
+| `kto` | only when the row does not fit `data.max_length` | end (`keep_end`), BOS kept in front |
+| `bco` | only when the row does not fit `data.max_length` | end (`keep_end`), BOS kept in front |
+
+When BCO, KTO, ORPO or SimPO keeps the end of a prompt that starts with the
+tokenizer's BOS token, the BOS stays in front, followed by the last
+`data.max_length // 2 - 1` prompt tokens.
+
+Keeping the end preserves a chat template's assistant header, which sits at
+the end of the prompt; DPO and IPO keep the start because that is TRL's
+default for `DPOConfig`, and Soup does not change it. Before #1209, DPO and
+ORPO cut every prompt longer than `data.max_length // 2`, including rows that
+fit; `backend: mlx` native DPO, ORPO and SimPO still do (see
+[SimPO on MLX](backends-and-ops.md#simpo-on-mlx)).
+
 ```yaml
 task: bco
 data:
@@ -1470,7 +1513,8 @@ when the fraction exceeds 5%) and persisted in `trainer_state.json` so
 `soup adapters audit` can see it.
 
 On Apple Silicon, `backend: mlx` trains GRPO natively with the same objective
-(TRL's `loss_type="dapo"` defaults) and the built-in rewards; see
+(TRL's `loss_type="dapo"` defaults) and the built-in rewards, on a dense or a
+pre-quantized 4-bit (`affine`) MLX base; see
 [GRPO on MLX](backends-and-ops.md#grpo-on-mlx) for the units, the rollout
 mode and what it refuses.
 
@@ -1935,14 +1979,13 @@ training:
   quantization: 4bit
 ```
 
-**Long prompts are capped as in DPO and ORPO.** trl's CPO trainer cuts only the
-answers, so after it tokenizes, `soup train` cuts the prompt to
-`data.max_length // 2` tokens, keeping its end, and the answers to the room
-left, for the train and validation splits. Every sequence is then at most
-`data.max_length`. The cut goes by the prompt alone: a prompt longer than
-`data.max_length // 2` tokens loses its start even when prompt and answers
-would fit in `data.max_length`. A row whose prompt is at most
-`data.max_length // 2` tokens and which fits is unchanged.
+**Long prompts are capped only when a row overflows.** trl's CPO trainer cuts
+only the answers, so a long prompt reached the model whole. A SimPO prompt is
+now cut only when the row does not fit in `data.max_length`: it is then cut to
+`data.max_length // 2` tokens, keeping its end, and the answers get the room
+left, for the train and validation splits, so every sequence is at most
+`data.max_length`. A row that fits is unchanged, whatever its prompt length
+(see the table under [Preference Variety](#preference-variety--bco--unified-dispatcher--kl-variants)).
 
 **Rows whose completion trl truncates away are refused.** trl's CPO trainer
 truncates each answer to `data.max_length` minus the **longer** answer's length,
@@ -2279,7 +2322,7 @@ the cross-entropy. See [EBFT / GDPO Loss Variants](#ebft--gdpo-loss-variants).
 
 ## gpt-oss `reasoning_effort` + `train_on_eot` (v0.52.0)
 
-`training.reasoning_effort: low | medium | high` injects a system-prefix token at training time for gpt-oss models; `training.train_on_eot: true` includes explicit EOT/EOS control tokens in the SFT loss (axolotl `train_on_eot`). Both are applied by the SFT formatter, which runs on `sft`, `tts` and `distill`, so those are the tasks they load on. Setting either on any other task (`pretrain`, DPO, GRPO, PPO, `classifier`, `reranker`, `cross_encoder`) fails at config load. Live formatter wiring in v0.52.1.
+`training.reasoning_effort: low | medium | high` injects a system-prefix token at training time for gpt-oss models; `training.train_on_eot: true` includes explicit EOT/EOS control tokens in the SFT loss (axolotl `train_on_eot`). Both are applied by the SFT formatter, which runs on `sft`, `tts` and `distill`, so those are the tasks they load on. Setting either on any other task (`pretrain`, DPO, GRPO, PPO, `classifier`, `reranker`, `cross_encoder`) fails at config load. Inside `task: sft` they are also gated on the path (#1698): `modality: vision` or `audio`, `data.format: raft` and `backend: mlx` apply neither, and `data.format: pre_tokenized` drops `reasoning_effort` because the cache is built without it, while `train_on_eot` keeps loading there since `soup data preprocess` keys the cache on it. Live formatter wiring in v0.52.1.
 
 
 ## MoLE — Per-Token Adapter Routing (`task='moe_lora_routing'`)

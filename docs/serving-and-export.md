@@ -44,6 +44,13 @@ soup merge --adapter ./output --base meta-llama/Llama-3.1-8B --dtype bfloat16
 soup merge --adapter ./output --output ./merged --low-memory
 ```
 
+Both merge paths reuse the base commit recorded in the adapter's `soup_run.json`
+when its base ID matches and its revision source is `hub_commit`, and print
+`Base revision: <commit> (recorded run)`. A different `--base` override, a local
+base, a non-Hugging-Face source or a legacy adapter keeps its existing loading
+behavior and prints the revision as unknown; Soup does not query today's Hub
+head to fill missing training history.
+
 `--low-memory` reads the base `.safetensors` files and writes the merged files
 one tensor at a time, so peak RAM is about one shard (the largest `.safetensors`
 file; a single-file model is memory-mapped as a whole, so it saves little). The
@@ -303,6 +310,18 @@ soup infer --backend mlx --model ./mlx-adapter --input prompts.jsonl --output re
 soup infer --backend mlx --model ./mlx-base --input prompts.jsonl --output results.jsonl
 ```
 
+Interactive chat uses the same component and artifact contract:
+
+```bash
+soup chat --backend mlx --model ./mlx-adapter --temperature 0
+soup chat --backend mlx --model ./mlx-base
+```
+
+Chat preserves conversation history, `/quit`, `/clear` and `/system`.
+Ctrl-C or end-of-input during native generation ends the session with `Goodbye!`;
+its in-memory conversation history is discarded.
+Native adapters passed to the default chat backend are refused with a backend hint.
+
 Inference uses a shared MLX loader and generation implementation. Native Soup
 adapters carry `model`, `num_layers` and resolved `lora_parameters` in
 `adapter_config.json`, alongside `adapters.safetensors`. The base identity comes from
@@ -438,6 +457,15 @@ Endpoints:
 - `GET /v1/models` — list available models
 - `GET /health` — health check
 
+On the Transformers backend, `"stream": true` on `/v1/chat/completions` sends the reply
+as the model generates it (word by word), so the first chunk arrives before generation
+ends. The chunk fields, final chunk, `[DONE]` and `finish_reason` are the same as for a
+reply generated in full. A request served with `--reasoning-parser`, a draft model
+(`--speculative-decoding`), n-gram lookup or MoLE routing is generated in full first and
+sent afterwards, and so is a request to a model whose generation config sets beam search
+(`num_beams` above 1) or several return sequences, and so is the `/v1/messages` stream.
+Use `--backend vllm` for token streaming with speculative decoding.
+
 Compatible with OpenAI SDK:
 ```python
 from openai import OpenAI
@@ -447,6 +475,8 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}],
 )
 ```
+
+On the default Transformers backend, including a MoLE runtime, `finish_reason` is `"length"` when generation used the whole `max_tokens` budget without an end token and `"stop"` otherwise, even when the end token is the last one the budget allows. `/v1/messages` reports the same as `stop_reason` `max_tokens` / `end_turn`, in the reply and in the final `message_delta` event.
 
 ### KV Cache Quantization (`soup serve --kv-cache-type`)
 
@@ -824,7 +854,7 @@ still records the URL it was given.
 
 **Pages:**
 - **Dashboard** — view all experiment runs, loss charts, system info, multi-run comparison
-- **New Training** — create configs from templates or 171 ready-made recipes, validate, start training with live SSE log streaming and progress bar
+- **New Training** — create configs from templates or 175 ready-made recipes, validate, start training with live SSE log streaming and progress bar
 - **Data Explorer** — browse and inspect datasets (JSONL, JSON, CSV, Parquet)
 - **Model Chat** — chat with streaming responses, configurable temperature/top_p/max_tokens, system prompt, adapter selection, markdown rendering, chat export
 
@@ -833,7 +863,7 @@ still records the URL it was given.
 - **Enhanced Metrics** — 2x2 chart grid (loss, LR, grad_norm, throughput) + GPU memory chart, eval results table
 - **Multi-Run Compare** — overlay loss curves from up to 5 runs side-by-side
 - **Chat Upgrade** — SSE streaming via proxy, typing indicator, cancel button, markdown renderer (bold, italic, code blocks), chat export as JSON
-- **Config Builder** — recipe dropdown (171 recipes), config schema API for dynamic form generation
+- **Config Builder** — recipe dropdown (175 recipes), config schema API for dynamic form generation
 
 Gradient norm is nullable: backends or steps that do not report it store and
 stream `null`, and the Web UI chart leaves a gap instead of drawing a false
@@ -910,7 +940,7 @@ closed allowlist / filtered-env rules as the other `soup llama` subcommands). Us
 it when you already have a GGUF and want llama.cpp's quantizer directly, rather
 than going through `soup export --format gguf` / `soup quantize`.
 
-Closed allowlist: `cli` / `mtmd-cli` / `gguf-split` / `server` / `quantize`. Forwards to the `llama-*` binary found in an absolute `PATH` directory (empty and relative entries and the current directory are not searched) with a **filtered child env** — `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and other secrets are dropped before exec; only `PATH` / `PATHEXT` / `SYSTEMROOT` / `NoDefaultCurrentDirectoryInExePath`, `HOME` / `USER` / `USERPROFILE` / `TMP` / `TEMP`, locale (`LANG` / `LC_ALL` / `LC_CTYPE`), `TERM` / `COLORTERM` and the llama.cpp-recognised `LLAMA_CPP_HOME` / `GGML_CUDA` / `GGML_METAL` / `OMP_NUM_THREADS` are forwarded. Names are matched without regard to case on Windows.
+Closed allowlist: `cli` / `mtmd-cli` / `gguf-split` / `server` / `quantize`. Forwards to the `llama-*` binary found in an absolute `PATH` directory (empty and relative entries and the current directory are not searched) with a **filtered child env** — `HF_TOKEN` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` and other secrets are dropped before exec; only `PATH` / `PATHEXT` / `SYSTEMROOT` / `NoDefaultCurrentDirectoryInExePath` (on Windows set to 1 for the child, whatever the parent has), `HOME` / `USER` / `USERPROFILE` / `TMP` / `TEMP`, locale (`LANG` / `LC_ALL` / `LC_CTYPE`), `TERM` / `COLORTERM` and the llama.cpp-recognised `LLAMA_CPP_HOME` / `GGML_CUDA` / `GGML_METAL` / `OMP_NUM_THREADS` are forwarded. Names are matched without regard to case on Windows.
 
 
 ## Tail-Latency Stats + Tool-Call Timer
@@ -990,7 +1020,7 @@ anthropic_payload = to_anthropic({
 })
 ```
 
-Multiple `system` messages join with `\n\n`. `tool` role with structured (list) content is concatenated into a single `tool_result` text block, never silently dropped. `max_tokens` capped at 16384, `temperature` bounded `[0.0, 2.0]`. `soup serve` exposes this converter as a live `POST /v1/messages` endpoint on both the transformers and vLLM backends; with `"stream": true` it answers in the Anthropic event shape.
+Multiple `system` messages join with `\n\n`. `tool` role with structured (list) content is concatenated into a single `tool_result` text block, never silently dropped. `max_tokens` capped at 16384, `temperature` bounded `[0.0, 2.0]`, `top_p` bounded `[0.0, 1.0]`. `soup serve` exposes this converter as a live `POST /v1/messages` endpoint on both the transformers and vLLM backends; with `"stream": true` it answers in the Anthropic event shape.
 
 
 ## Server-Side Tools
@@ -1032,7 +1062,9 @@ Non-streaming requests return Anthropic-shaped envelopes. Streaming (`stream: tr
 returns Anthropic event-shape SSE with `message_start` → `content_block_delta` →
 `message_delta` + `message_stop` events. Validation errors return a generic
 `"Invalid request"` 400 body with details logged server-side at DEBUG. CORS restricted
-to loopback-only (`localhost` / `127.0.0.1`) on both backends.
+to loopback-only (`localhost` / `127.0.0.1`) on both backends, and on both a request whose
+`Origin` names another site is refused with 403 (see
+[Server-Side Tool Endpoints](#server-side-tool-endpoints)).
 
 
 ## N-gram Speculative Decoding
@@ -1062,6 +1094,13 @@ Three POST routes are now available on `soup serve`:
   sending signals only to the run itself. Run
   `soup serve` in a container, a VM or under a dedicated unprivileged account for any
   caller you do not fully trust.
+  Returns the real stdout, stderr, exit code, and timeout state. A timeout returns
+  `timed_out: true` and `exit_code: 124`; an output overflow returns
+  `timed_out: false` and `exit_code: 1`. Other process failures retain their exit
+  code and report `timed_out: false`. The combined stdout/stderr cap is 10 KB.
+  The code is compiled under the file name `<code>`, so a traceback gives the caller's
+  own line numbers (`File "<code>", line 2` for an error on the second line). Tool
+  authentication failures return HTTP 401 with `WWW-Authenticate: Bearer`.
 - **`POST /v1/tools/web_search`** — searches the web and returns domain-filtered results
   as `[{url, title, snippet}]` with snippets sanitized (null bytes stripped).
   Deny-by-default via `WebSearchConfig.domain_allowlist`.
@@ -1078,6 +1117,11 @@ Three POST routes are now available on `soup serve`:
   The endpoint fails closed with
   HTTP 501 when strict OS isolation is unavailable (including on Windows or restricted
   Linux containers).
+
+When the sandbox cannot start, `/v1/tools/python` answers 501 with
+`python sandbox requires OS-level isolation` and `/v1/tools/bash` with
+`bash sandbox requires OS-level isolation`, whatever the cause; the cause is logged on the
+server at DEBUG level.
 
 **`/v1/tools/python` and `/v1/tools/bash` need `--tool-auth-token` on every bind.** A
 server started without it answers both routes with 401 on loopback too, as it already did
@@ -1103,6 +1147,12 @@ a long random one, such as the one generated above
 loopback or behind a proxy that terminates TLS: the Bearer header is sent in clear text
 over plain HTTP.
 
+The token must be 16 to 128 characters from `A-Z`, `a-z`, `0-9`, `_` and `-`, the rule
+`soup ui` and `soup mcp serve` apply to theirs. `soup serve` checks the value from the
+option or from `SOUP_TOOL_AUTH_TOKEN` first, on every bind, and exits with status 2 before
+loading the model when it does not match; the message names the rule, never the value. An
+empty value counts as no token.
+
 `/v1/tools/web_search`, `/v1/thumbs` and the adapter routes keep their rule: on a loopback
 bind they take a token only when the server has one.
 
@@ -1119,7 +1169,9 @@ another site is refused with 403, so a page the operator merely visits cannot dr
 generation on their server or enumerate the loaded adapters — CORS alone would only stop
 that page *reading* the reply, not sending the request. Requests that carry no `Origin` at
 all — curl, the OpenAI/Anthropic SDKs, a reverse proxy — are unaffected, and `Host` is not
-checked on these routes, so a proxy can still front them under its own hostname.
+checked on these routes, so a proxy can still front them under its own hostname. The
+`--backend vllm`, `sglang` and `mii` servers apply the same `Origin` check to their
+generation routes (`/v1/chat/completions`, and `/v1/messages` on vLLM).
 
 **What `--tool-auth-token` does not cover.** `soup serve` refuses a non-loopback `--host`
 without `--tool-auth-token`, but the token is checked on the tool routes, `/v1/thumbs` and
@@ -1129,5 +1181,6 @@ put a proxy that authenticates in front of the server if that is not intended. W
 `--backend vllm`, `sglang` or `mii` there are no tool or adapter routes, so no route checks
 the token. On a wildcard bind (`0.0.0.0`, `::`) there is no single name to compare `Host`
 against, so the routes that otherwise compare it check only that an `Origin` header, when
-sent, names the same host as `Host`. `soup serve` prints these points at startup whenever
-it binds beyond loopback.
+sent, names the same host as `Host`. Every route speaks plain HTTP: `soup serve` has no
+TLS, so terminate TLS in a proxy in front of a server other machines reach. `soup serve`
+prints these notes at startup whenever it binds beyond loopback.

@@ -243,6 +243,22 @@ def test_a_small_or_non_cpu_request_is_left_as_it_is():
     assert into is target and not target.is_meta and bool((target == 0).all())
 
 
+def test_a_large_cuda_request_is_not_redirected_to_meta():
+    from soup_cli.utils.layer_stream_runtime import _large_cpu_requests_on_meta
+
+    def allocate():
+        try:
+            tensor = torch.empty(LARGE, dtype=torch.float32, device="cuda")
+        except (RuntimeError, AssertionError) as error:
+            return type(error), str(error)
+        return tensor.device, tensor.shape, tensor.dtype
+
+    outside = allocate()
+    with _large_cpu_requests_on_meta(LARGE):
+        inside = allocate()
+    assert inside == outside
+
+
 def test_the_streamed_model_builds_and_steps_on_the_twin(twin, tmp_path):
     from peft import LoraConfig, TaskType
 
@@ -273,8 +289,10 @@ import sys
 
 import torch
 
+import soup_cli
 from soup_cli.utils.layer_stream_runtime import build_meta_skeleton
 
+print(soup_cli.__file__)
 build_meta_skeleton(sys.argv[1], dtype="bfloat16", quant=sys.argv[2])
 with torch.device("meta"):
     made = [torch.empty(2, 2), torch.zeros(2, 2), torch.ones(2, 2), torch.full((2, 2), 1.0)]
@@ -289,15 +307,26 @@ def test_a_meta_device_context_still_works_after_the_build(twin, tmp_path, quant
     import os
     import subprocess
     import sys
+    from pathlib import Path
 
     if quant == "nf4":
         pytest.importorskip("bitsandbytes")
     script = tmp_path / "check.py"
     script.write_text(_FRESH_PROCESS_CHECK, encoding="utf-8")
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1")
+    # The child imports this tree's soup_cli, not an installed copy.
+    src = Path(__file__).resolve().parents[1] / "src"
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="-1", PYTHONPATH=str(src))
     done = subprocess.run(
-        [sys.executable, str(script), twin, quant], capture_output=True, text=True, env=env
+        [sys.executable, str(script), twin, quant],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
     )
 
     assert done.returncode == 0, done.stderr[-2000:]
-    assert done.stdout.split() == ["meta"] * 4
+    lines = done.stdout.splitlines()
+    assert os.path.commonpath(
+        [os.path.realpath(lines[0]), os.path.realpath(src)]
+    ) == os.path.realpath(src), lines[0]
+    assert lines[-1].split() == ["meta"] * 4
